@@ -2,19 +2,24 @@
 """
 VPN Rotator for testing a command inside a VPN namespace.
 - Rotates through VPNGate profiles (no repeat per day)
+- Auto failover on connection failure
+- Moves failed profiles to failed/ folder
 """
 
 import json
+import shlex
 import shutil
+import subprocess
 import sys
 from datetime import date
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 VPN_PROFILES_DIR = Path("vpn_profiles")
 FAILED_DIR = Path("vpn_profiles_failed")
 STATE_FILE = Path("vpn_state.json")
 DEFAULT_COMMAND = "papapopo"
+TIMEOUT = 30
 
 
 def load_state() -> dict:
@@ -73,13 +78,41 @@ def move_to_failed(profile: Path) -> None:
     print(f"Moved failed profile to {dest}")
 
 
+def run_vopono(profile: Path, application: str) -> Tuple[bool, Optional[int]]:
+    cmd = ["vopono", "exec", "--custom", str(profile), "--protocol", "openvpn", application]
+    print(f"Running: {shlex.join(cmd)}")
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        out, err = proc.communicate(timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        print(f"Command timed out after {TIMEOUT}s")
+        return False, None
+    print(out, end="")
+    if err:
+        print(err, end="", file=sys.stderr)
+    return proc.returncode == 0, proc.returncode
+
+
 def main() -> None:
     state = reset_daily_state_if_needed(load_state())
-    profile = select_next_profile(state)
-    if not profile:
-        print("No available VPN profiles")
-        sys.exit(1)
-    print(f"Next profile: {profile.name}")
+    while True:
+        profile = select_next_profile(state)
+        if not profile:
+            print("No available VPN profiles")
+            sys.exit(1)
+
+        print(f"\nTrying profile: {profile.name}")
+        success, _ = run_vopono(profile, DEFAULT_COMMAND)
+        if success:
+            state["used_today"].append(profile.name)
+            save_state(state)
+            print("Success! Profile marked as used today.")
+            break
+        print(f"Profile {profile.name} failed, moving to failed folder...")
+        move_to_failed(profile)
+        state = reset_daily_state_if_needed(load_state())
 
 
 if __name__ == "__main__":
