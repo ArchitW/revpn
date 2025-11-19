@@ -7,8 +7,10 @@ VPN Rotator for testing a command inside a VPN namespace.
 """
 
 import json
+import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 from datetime import date
@@ -78,18 +80,54 @@ def move_to_failed(profile: Path) -> None:
     print(f"Moved failed profile to {dest}")
 
 
-def run_vopono(profile: Path, application: str) -> Tuple[bool, Optional[int]]:
-    cmd = ["vopono", "exec", "--custom", str(profile), "--protocol", "openvpn", application]
+def _kill_process_group(proc: "subprocess.Popen") -> None:
+    """Kill the whole process group so openvpn (a child of vopono) is not orphaned."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        proc.kill()
+
+
+def run_vopono(
+    profile: Path,
+    application: str,
+    verbose: bool = False,
+) -> Tuple[bool, Optional[int]]:
+    cmd = ["vopono"]
+    if verbose:
+        cmd.append("-v")
+    cmd.extend(["exec", "--custom", str(profile), "--protocol", "openvpn", application])
+
     print(f"Running: {shlex.join(cmd)}")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    if sys.stdin.isatty():
+        # Inherit the controlling terminal so TUI apps work.
+        # No timeout: the app runs until the user quits; vopono's own
+        # connect timeout fails bad profiles.
+        proc = subprocess.Popen(cmd)
+        rc = proc.wait()
+        return (rc == 0), rc
+
+    # Batch mode: capture output and enforce a timeout, killing the
+    # whole process group so openvpn does not survive as an orphan.
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
     try:
         out, err = proc.communicate(timeout=TIMEOUT)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        _kill_process_group(proc)
         proc.communicate()
         print(f"Command timed out after {TIMEOUT}s")
         return False, None
-    print(out, end="")
+    if out:
+        print(out, end="")
     if err:
         print(err, end="", file=sys.stderr)
     return proc.returncode == 0, proc.returncode
