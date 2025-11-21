@@ -4,6 +4,14 @@ VPN Rotator for testing a command inside a VPN namespace.
 - Rotates through VPNGate profiles (no repeat per day)
 - Auto failover on connection failure
 - Moves failed profiles to failed/ folder
+
+The command is handed to `vopono exec` as a single shell-split string, so you
+can pass arguments too:
+    python main.py -- mytool --flag value
+
+The executable is looked up with shutil.which() first - the same thing as
+wrapping it in "$(which __COMMAND__)" - because vopono launches it through
+`sudo --set-home`, whose PATH may not include your user's tool directories.
 """
 
 import json
@@ -15,7 +23,7 @@ import subprocess
 import sys
 from datetime import date
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 VPN_PROFILES_DIR = Path("vpn_profiles")
 FAILED_DIR = Path("vpn_profiles_failed")
@@ -80,6 +88,33 @@ def move_to_failed(profile: Path) -> None:
     print(f"Moved failed profile to {dest}")
 
 
+def parse_command(values: Sequence[str]) -> List[str]:
+    """Turn CLI values into argv, defaulting to DEFAULT_COMMAND.
+
+    Accepts either separate words (`main.py mytool --flag`) or one quoted
+    string (`main.py "mytool --flag"`).
+    """
+    if not values:
+        return [DEFAULT_COMMAND]
+    if len(values) == 1 and " " in values[0] and not Path(values[0]).expanduser().exists():
+        return shlex.split(values[0])
+    return list(values)
+
+
+def resolve_executable(command: Sequence[str]) -> Optional[str]:
+    """Resolve the program to an absolute path, like `which` does."""
+    exe = command[0]
+    if "/" in exe:
+        path = Path(exe).expanduser()
+        return str(path) if path.is_file() else None
+    return shutil.which(exe)
+
+
+def quote_command(command: Sequence[str]) -> str:
+    """vopono exec takes the application as one shell-split string."""
+    return shlex.join(command)
+
+
 def _kill_process_group(proc: "subprocess.Popen") -> None:
     """Kill the whole process group so openvpn (a child of vopono) is not orphaned."""
     try:
@@ -135,6 +170,15 @@ def run_vopono(
 
 def main() -> None:
     state = reset_daily_state_if_needed(load_state())
+    command = parse_command(sys.argv[1:])
+    resolved = resolve_executable(command)
+    if resolved:
+        command = [resolved, *command[1:]]
+        print(f"Command: {shlex.join(command)}")
+    else:
+        print(f"Warning: {command[0]!r} not found on PATH", file=sys.stderr)
+    application = quote_command(command)
+
     while True:
         profile = select_next_profile(state)
         if not profile:
@@ -142,7 +186,7 @@ def main() -> None:
             sys.exit(1)
 
         print(f"\nTrying profile: {profile.name}")
-        success, _ = run_vopono(profile, DEFAULT_COMMAND)
+        success, _ = run_vopono(profile, application)
         if success:
             state["used_today"].append(profile.name)
             save_state(state)
