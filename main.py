@@ -12,6 +12,9 @@ can pass arguments too:
 The executable is looked up with shutil.which() first - the same thing as
 wrapping it in "$(which __COMMAND__)" - because vopono launches it through
 `sudo --set-home`, whose PATH may not include your user's tool directories.
+If vopono still reports "command not found", the command is retried wrapped in
+`sh -c 'exec "$(command -v ...)" ...'`, and a command problem never burns a
+profile (it exits instead of moving the profile to vpn_profiles_failed).
 """
 
 import json
@@ -30,6 +33,15 @@ FAILED_DIR = Path("vpn_profiles_failed")
 STATE_FILE = Path("vpn_state.json")
 DEFAULT_COMMAND = "papapopo"
 TIMEOUT = 30
+
+# vopono fails with one of these when it cannot exec the app at all. That is a
+# command/installation problem, not a bad VPN profile.
+NOT_FOUND_MARKERS = (
+    "command not found",
+    "no such file or directory",
+    "executable file not found",
+    "not found in $path",
+)
 
 
 def load_state() -> dict:
@@ -115,6 +127,19 @@ def quote_command(command: Sequence[str]) -> str:
     return shlex.join(command)
 
 
+def shell_wrap_command(command: Sequence[str]) -> str:
+    """Resolve the binary at exec time with $(which ...), inside the namespace."""
+    wrapper = 'exec "$(command -v "$0" || which "$0")" "$@"'
+    return shlex.join(["sh", "-c", wrapper, *command])
+
+
+def looks_like_command_error(returncode: Optional[int], output: str) -> bool:
+    if returncode == 127:
+        return True
+    text = (output or "").lower()
+    return any(marker in text for marker in NOT_FOUND_MARKERS)
+
+
 def _kill_process_group(proc: "subprocess.Popen") -> None:
     """Kill the whole process group so openvpn (a child of vopono) is not orphaned."""
     try:
@@ -129,43 +154,53 @@ def run_vopono(
     profile: Path,
     application: str,
     verbose: bool = False,
-) -> Tuple[bool, Optional[int]]:
+    interactive: Optional[bool] = None,
+) -> Tuple[bool, Optional[int], str]:
     cmd = ["vopono"]
     if verbose:
         cmd.append("-v")
     cmd.extend(["exec", "--custom", str(profile), "--protocol", "openvpn", application])
 
     print(f"Running: {shlex.join(cmd)}")
+    if interactive is None:
+        interactive = sys.stdin.isatty()
 
-    if sys.stdin.isatty():
-        # Inherit the controlling terminal so TUI apps work.
-        # No timeout: the app runs until the user quits; vopono's own
-        # connect timeout fails bad profiles.
-        proc = subprocess.Popen(cmd)
-        rc = proc.wait()
-        return (rc == 0), rc
-
-    # Batch mode: capture output and enforce a timeout, killing the
-    # whole process group so openvpn does not survive as an orphan.
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
     try:
-        out, err = proc.communicate(timeout=TIMEOUT)
-    except subprocess.TimeoutExpired:
-        _kill_process_group(proc)
-        proc.communicate()
-        print(f"Command timed out after {TIMEOUT}s")
-        return False, None
-    if out:
-        print(out, end="")
-    if err:
-        print(err, end="", file=sys.stderr)
-    return proc.returncode == 0, proc.returncode
+        if interactive:
+            # Inherit the controlling terminal so TUI apps work.
+            # No timeout: the app runs until the user quits; vopono's own
+            # connect timeout fails bad profiles.
+            proc = subprocess.Popen(cmd)
+            rc = proc.wait()
+            if rc == 0:
+                return True, 0, ""
+            return False, rc, ""
+        else:
+            # Batch mode: capture output and enforce a timeout, killing the
+            # whole process group so openvpn does not survive as an orphan.
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            try:
+                out, err = proc.communicate(timeout=TIMEOUT)
+            except subprocess.TimeoutExpired:
+                _kill_process_group(proc)
+                proc.communicate()
+                print(f"Command timed out after {TIMEOUT}s")
+                return False, None, f"timed out after {TIMEOUT}s"
+            if out:
+                print(out)
+            if err:
+                print(err, file=sys.stderr)
+            if proc.returncode == 0:
+                return True, 0, ""
+            return False, proc.returncode, (err or "") + (out or "")
+    except FileNotFoundError:
+        sys.exit("vopono is not installed or not on PATH")
 
 
 def main() -> None:
@@ -176,8 +211,10 @@ def main() -> None:
         command = [resolved, *command[1:]]
         print(f"Command: {shlex.join(command)}")
     else:
-        print(f"Warning: {command[0]!r} not found on PATH", file=sys.stderr)
-    application = quote_command(command)
+        print(
+            f"Warning: {command[0]!r} not found on PATH, will retry with $(which {command[0]}) inside the namespace",
+            file=sys.stderr,
+        )
 
     while True:
         profile = select_next_profile(state)
@@ -186,7 +223,21 @@ def main() -> None:
             sys.exit(1)
 
         print(f"\nTrying profile: {profile.name}")
-        success, _ = run_vopono(profile, application)
+        success, returncode, output = run_vopono(profile, quote_command(command))
+
+        if not success and looks_like_command_error(returncode, output):
+            print(f"{command[0]!r} not found; retrying wrapped with $(which {command[0]})")
+            success, returncode, output = run_vopono(profile, shell_wrap_command(command))
+            if not success and looks_like_command_error(returncode, output):
+                print(
+                    f"Error: cannot find {command[0]!r} inside the VPN namespace.\n"
+                    "Pass an absolute path instead, e.g.:\n"
+                    f"  python main.py -- {Path(command[0]).expanduser().absolute()} <args>",
+                    file=sys.stderr,
+                )
+                print(f"Not quarantining {profile.name}: this is a command problem, not a VPN problem.", file=sys.stderr)
+                sys.exit(1)
+
         if success:
             state["used_today"].append(profile.name)
             save_state(state)
