@@ -204,8 +204,63 @@ def run_vopono(
 
 
 def main() -> None:
-    state = reset_daily_state_if_needed(load_state())
-    command = parse_command(sys.argv[1:])
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="VPN rotator for testing a command inside a VPN namespace",
+        epilog=(
+            "The command defaults to 'papapopo' and is resolved via which.\n"
+            "Use -- before the command if it has flags of its own:\n"
+            "  python main.py -- mytool --verbose --input x"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose vopono output")
+    parser.add_argument("--reset", action="store_true", help="Reset daily usage tracking")
+    parser.add_argument("--list", action="store_true", help="List available profiles")
+    parser.add_argument("--list-failed", action="store_true", help="List failed profiles")
+    parser.add_argument("--restore-failed", metavar="PROFILE", help="Move a failed profile back to active")
+    parser.add_argument(
+        "command",
+        nargs="*",
+        metavar="COMMAND",
+        help=f"Command (and arguments) to run inside the VPN. Default: {DEFAULT_COMMAND}",
+    )
+    args = parser.parse_args()
+
+    if args.list:
+        profiles = get_available_profiles()
+        print(f"Available profiles ({len(profiles)}):")
+        for p in profiles:
+            print(f"  {p.name}")
+        return
+
+    if args.list_failed:
+        failed = get_failed_profiles()
+        print(f"Failed profiles ({len(failed)}):")
+        for p in failed:
+            print(f"  {p.name}")
+        return
+
+    if args.restore_failed:
+        src_path = FAILED_DIR / args.restore_failed
+        if src_path.exists():
+            shutil.move(str(src_path), str(VPN_PROFILES_DIR / args.restore_failed))
+            print(f"Restored {args.restore_failed} to active profiles")
+        else:
+            print(f"Profile not found in failed: {args.restore_failed}")
+        return
+
+    state = load_state()
+    if args.reset:
+        state = {"used_today": [], "date": str(date.today())}
+        save_state(state)
+        print("Daily usage tracking reset")
+        return
+
+    state = reset_daily_state_if_needed(state)
+
+    command = parse_command(args.command)
     resolved = resolve_executable(command)
     if resolved:
         command = [resolved, *command[1:]]
@@ -223,11 +278,11 @@ def main() -> None:
             sys.exit(1)
 
         print(f"\nTrying profile: {profile.name}")
-        success, returncode, output = run_vopono(profile, quote_command(command))
+        success, returncode, output = run_vopono(profile, quote_command(command), args.verbose)
 
         if not success and looks_like_command_error(returncode, output):
             print(f"{command[0]!r} not found; retrying wrapped with $(which {command[0]})")
-            success, returncode, output = run_vopono(profile, shell_wrap_command(command))
+            success, returncode, output = run_vopono(profile, shell_wrap_command(command), args.verbose)
             if not success and looks_like_command_error(returncode, output):
                 print(
                     f"Error: cannot find {command[0]!r} inside the VPN namespace.\n"
@@ -245,7 +300,8 @@ def main() -> None:
             break
         print(f"Profile {profile.name} failed, moving to failed folder...")
         move_to_failed(profile)
-        state = reset_daily_state_if_needed(load_state())
+        state = load_state()
+        state = reset_daily_state_if_needed(state)
 
 
 if __name__ == "__main__":
