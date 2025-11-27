@@ -19,6 +19,7 @@ profile (it exits instead of moving the profile to vpn_profiles_failed).
 
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -33,6 +34,7 @@ FAILED_DIR = Path("vpn_profiles_failed")
 STATE_FILE = Path("vpn_state.json")
 DEFAULT_COMMAND = "papapopo"
 TIMEOUT = 30
+INTERFACE_PREFIX = "vo_c_"
 
 # vopono fails with one of these when it cannot exec the app at all. That is a
 # command/installation problem, not a bad VPN profile.
@@ -138,6 +140,66 @@ def looks_like_command_error(returncode: Optional[int], output: str) -> bool:
         return True
     text = (output or "").lower()
     return any(marker in text for marker in NOT_FOUND_MARKERS)
+
+
+def list_vopono_interfaces() -> List[str]:
+    """Return the names of leftover vopono interfaces (vo_c_*)."""
+    try:
+        result = subprocess.run(
+            ["ip", "link", "show"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(f"Could not list interfaces: {e}", file=sys.stderr)
+        return []
+
+    interfaces = []
+    for line in result.stdout.splitlines():
+        match = re.match(r"^\d+:\s+([^@\s:]+)", line)
+        if match and match.group(1).startswith(INTERFACE_PREFIX):
+            interfaces.append(match.group(1))
+    return interfaces
+
+
+def cleanup_vopono_interfaces() -> None:
+    """Delete any orphaned vo_c_* interfaces left behind by an abrupt vopono exit."""
+    interfaces = list_vopono_interfaces()
+    if not interfaces:
+        print("No leftover vopono interfaces.")
+        return
+    for iface in interfaces:
+        print(f"Deleting leftover interface: {iface}")
+        result = subprocess.run(
+            ["sudo", "-n", "ip", "link", "delete", iface],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            msg = (result.stderr or result.stdout or "").strip()
+            print(
+                f"Failed to delete {iface}: {msg}\n"
+                f"Run manually: sudo ip link delete {iface}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"Deleted {iface}")
+
+
+def ensure_sudo() -> bool:
+    """Cache sudo credentials so cleanup can use `sudo -n` without re-prompting.
+
+    Returns True if sudo is available without a prompt, or after a successful
+    `sudo -v` on a terminal. Returns False if sudo needs a password but no
+    terminal is available (batch mode).
+    """
+    if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
+        return True
+    if not sys.stdin.isatty():
+        return False
+    print("Caching sudo credentials for cleanup (enter password)...")
+    return subprocess.run(["sudo", "-v"], capture_output=True).returncode == 0
 
 
 def _kill_process_group(proc: "subprocess.Popen") -> None:
@@ -271,6 +333,9 @@ def main() -> None:
             file=sys.stderr,
         )
 
+    ensure_sudo()
+    cleanup_vopono_interfaces()
+
     while True:
         profile = select_next_profile(state)
         if not profile:
@@ -279,10 +344,12 @@ def main() -> None:
 
         print(f"\nTrying profile: {profile.name}")
         success, returncode, output = run_vopono(profile, quote_command(command), args.verbose)
+        cleanup_vopono_interfaces()
 
         if not success and looks_like_command_error(returncode, output):
             print(f"{command[0]!r} not found; retrying wrapped with $(which {command[0]})")
             success, returncode, output = run_vopono(profile, shell_wrap_command(command), args.verbose)
+            cleanup_vopono_interfaces()
             if not success and looks_like_command_error(returncode, output):
                 print(
                     f"Error: cannot find {command[0]!r} inside the VPN namespace.\n"
