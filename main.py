@@ -27,7 +27,7 @@ import subprocess
 import sys
 from datetime import date
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Set, Tuple
 
 VPN_PROFILES_DIR = Path("vpn_profiles")
 FAILED_DIR = Path("vpn_profiles_failed")
@@ -187,6 +187,63 @@ def cleanup_vopono_interfaces() -> None:
             print(f"Deleted {iface}")
 
 
+def _active_namespaces() -> Set[str]:
+    """Namespaces vopono currently tracks as running."""
+    try:
+        result = subprocess.run(
+            ["vopono", "list", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return set()
+        data = json.loads(result.stdout)
+        return {app["namespace_id"] for app in data.get("applications", [])}
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError, KeyError):
+        return set()
+
+
+def cleanup_stale_namespaces() -> None:
+    """Delete vo_c_* network namespaces that vopono is no longer tracking."""
+    active = _active_namespaces()
+    try:
+        result = subprocess.run(
+            ["ip", "netns", "list"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        ns = parts[0]
+        if not ns.startswith(INTERFACE_PREFIX) or ns in active:
+            continue
+        print(f"Deleting stale namespace: {ns}")
+        r = subprocess.run(
+            ["sudo", "-n", "ip", "netns", "delete", ns],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            msg = (r.stderr or r.stdout or "").strip()
+            print(
+                f"  could not delete {ns}: {msg}\n"
+                f"  Run manually: sudo ip netns delete {ns}",
+                file=sys.stderr,
+            )
+
+
+def cleanup_vopono() -> None:
+    """Full cleanup: orphaned interfaces + stale namespaces."""
+    cleanup_vopono_interfaces()
+    cleanup_stale_namespaces()
+
+
 def ensure_sudo() -> bool:
     """Cache sudo credentials so cleanup can use `sudo -n` without re-prompting.
 
@@ -282,6 +339,8 @@ def main() -> None:
     parser.add_argument("--list", action="store_true", help="List available profiles")
     parser.add_argument("--list-failed", action="store_true", help="List failed profiles")
     parser.add_argument("--restore-failed", metavar="PROFILE", help="Move a failed profile back to active")
+    parser.add_argument("--cleanup-only", action="store_true", help="Delete leftover vo_c_* interfaces and exit")
+    parser.add_argument("--no-cleanup", action="store_true", help="Skip cleanup of leftover vo_c_* interfaces")
     parser.add_argument(
         "command",
         nargs="*",
@@ -313,6 +372,10 @@ def main() -> None:
             print(f"Profile not found in failed: {args.restore_failed}")
         return
 
+    if args.cleanup_only:
+        cleanup_vopono()
+        return
+
     state = load_state()
     if args.reset:
         state = {"used_today": [], "date": str(date.today())}
@@ -333,8 +396,9 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    ensure_sudo()
-    cleanup_vopono_interfaces()
+    if not args.no_cleanup:
+        ensure_sudo()
+        cleanup_vopono()
 
     while True:
         profile = select_next_profile(state)
@@ -344,12 +408,14 @@ def main() -> None:
 
         print(f"\nTrying profile: {profile.name}")
         success, returncode, output = run_vopono(profile, quote_command(command), args.verbose)
-        cleanup_vopono_interfaces()
+        if not args.no_cleanup:
+            cleanup_vopono()
 
         if not success and looks_like_command_error(returncode, output):
             print(f"{command[0]!r} not found; retrying wrapped with $(which {command[0]})")
             success, returncode, output = run_vopono(profile, shell_wrap_command(command), args.verbose)
-            cleanup_vopono_interfaces()
+            if not args.no_cleanup:
+                cleanup_vopono()
             if not success and looks_like_command_error(returncode, output):
                 print(
                     f"Error: cannot find {command[0]!r} inside the VPN namespace.\n"
