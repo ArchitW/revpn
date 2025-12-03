@@ -22,8 +22,10 @@ safe to take with split(',')[-1], even if the Message field (index 13) happens
 to contain commas.
 
 Usage:
-    python fetch_profiles.py                 # download all
+    python fetch_profiles.py                 # download all, skip duplicates
+    python fetch_profiles.py --limit 10      # only grab 10 new ones
     python fetch_profiles.py --out /tmp/vg   # write elsewhere
+    python fetch_profiles.py --force         # ignore dedup and rewrite
 """
 
 import argparse
@@ -32,7 +34,7 @@ import binascii
 import sys
 import urllib.request
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 API_URL = "https://www.vpngate.net/api/iphone/"
 PROFILES_DIR = Path("vpn_profiles")
@@ -98,6 +100,24 @@ def proto_of(config: str) -> str:
     return "tcp"
 
 
+def existing_remotes(directory: Path) -> Set[str]:
+    """Collect the remote hosts already present in a directory of .ovpn files."""
+    found: Set[str] = set()
+    if not directory.exists():
+        return found
+    for ovpn in directory.glob("*.ovpn"):
+        try:
+            text = ovpn.read_text(errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if line.startswith("remote "):
+                toks = line.split()
+                if len(toks) >= 2:
+                    found.add(toks[1])
+    return found
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Download OpenVPN profiles from VPN Gate into vpn_profiles/",
@@ -107,6 +127,18 @@ def main():
         "--out",
         default=str(PROFILES_DIR),
         help=f"Directory to write .ovpn files into (default: {PROFILES_DIR})",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Ignore dedup and re-download servers already present",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Stop after downloading N new profiles (0 = no limit)",
     )
     args = parser.parse_args()
 
@@ -119,10 +151,14 @@ def main():
     except Exception as e:  # noqa: BLE001 - surface any fetch error cleanly
         sys.exit(f"Failed to fetch VPN Gate list: {e}")
 
-    downloaded = failed = 0
+    known_remotes = existing_remotes(out_dir)
+
+    downloaded = skipped = failed = 0
     for line in lines:
         if not line or line.startswith("*") or line.startswith("#"):
             continue
+        if args.limit and downloaded >= args.limit:
+            break
 
         row = parse_row(line)
         if not row:
@@ -136,8 +172,15 @@ def main():
         host, port = hostport
         proto = proto_of(row["config"])
 
+        if not args.force and host in known_remotes:
+            skipped += 1
+            continue
+
         filename = f"vpngate_{row['hostname']}_{proto}_{port}.ovpn"
         dest = out_dir / filename
+        if dest.exists() and not args.force:
+            skipped += 1
+            continue
 
         try:
             dest.write_text(row["config"])
@@ -146,6 +189,7 @@ def main():
             failed += 1
             continue
 
+        known_remotes.add(host)
         downloaded += 1
         print(
             f"  + {filename}  "
@@ -153,7 +197,7 @@ def main():
         )
 
     print(
-        f"\nDone. downloaded={downloaded} failed={failed}\n"
+        f"\nDone. downloaded={downloaded} skipped={skipped} failed={failed}\n"
         f"Profiles in {out_dir}"
     )
 
