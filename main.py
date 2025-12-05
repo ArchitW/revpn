@@ -400,42 +400,50 @@ def main() -> None:
         ensure_sudo()
         cleanup_vopono()
 
-    while True:
-        profile = select_next_profile(state)
-        if not profile:
-            print("No available VPN profiles")
-            sys.exit(1)
-
-        print(f"\nTrying profile: {profile.name}")
-        success, returncode, output = run_vopono(profile, quote_command(command), args.verbose)
-        if not args.no_cleanup:
-            cleanup_vopono()
-
-        if not success and looks_like_command_error(returncode, output):
-            print(f"{command[0]!r} not found; retrying wrapped with $(which {command[0]})")
-            success, returncode, output = run_vopono(profile, shell_wrap_command(command), args.verbose)
-            if not args.no_cleanup:
-                cleanup_vopono()
-            if not success and looks_like_command_error(returncode, output):
-                print(
-                    f"Error: cannot find {command[0]!r} inside the VPN namespace.\n"
-                    "Pass an absolute path instead, e.g.:\n"
-                    f"  python main.py -- {Path(command[0]).expanduser().absolute()} <args>",
-                    file=sys.stderr,
-                )
-                print(f"Not quarantining {profile.name}: this is a command problem, not a VPN problem.", file=sys.stderr)
+    try:
+        while True:
+            profile = select_next_profile(state)
+            if not profile:
+                print("No available VPN profiles")
                 sys.exit(1)
 
-        if success:
-            state["used_today"].append(profile.name)
-            save_state(state)
-            print("Success! Profile marked as used today.")
-            break
-        print(f"Profile {profile.name} failed, moving to failed folder...")
-        move_to_failed(profile)
-        state = load_state()
-        state = reset_daily_state_if_needed(state)
+            print(f"\nTrying profile: {profile.name}")
+            success, returncode, output = run_vopono(profile, quote_command(command), args.verbose)
+            if not args.no_cleanup:
+                cleanup_vopono()
 
+            if not success and looks_like_command_error(returncode, output):
+                print(f"{command[0]!r} not found; retrying wrapped with $(which {command[0]})")
+                success, returncode, output = run_vopono(profile, shell_wrap_command(command), args.verbose)
+                if not args.no_cleanup:
+                    cleanup_vopono()
+                if not success and looks_like_command_error(returncode, output):
+                    print(
+                        f"Error: cannot find {command[0]!r} inside the VPN namespace.\n"
+                        "Pass an absolute path instead, e.g.:\n"
+                        f"  python main.py -- {Path(command[0]).expanduser().absolute()} <args>",
+                        file=sys.stderr,
+                    )
+                    print(f"Not quarantining {profile.name}: this is a command problem, not a VPN problem.", file=sys.stderr)
+                    sys.exit(1)
+
+            if success:
+                state["used_today"].append(profile.name)
+                save_state(state)
+                print("Success! Profile marked as used today.")
+                break
+            print(f"Profile {profile.name} failed, moving to failed folder...")
+            move_to_failed(profile)
+            state = load_state()
+            state = reset_daily_state_if_needed(state)
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        if not args.no_cleanup:
+            cleanup_vopono()
+        sys.exit(130)
+    finally:
+        if not args.no_cleanup:
+            cleanup_vopono()
 
 if __name__ == "__main__":
     main()
