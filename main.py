@@ -4,6 +4,7 @@ VPN Rotator for testing a command inside a VPN namespace.
 - Rotates through VPNGate profiles (no repeat per day)
 - Auto failover on connection failure
 - Moves failed profiles to failed/ folder
+- Runs a command (default: papapopo) inside VPN namespace via vopono
 
 The command is handed to `vopono exec` as a single shell-split string, so you
 can pass arguments too:
@@ -187,6 +188,21 @@ def cleanup_vopono_interfaces() -> None:
             print(f"Deleted {iface}")
 
 
+def ensure_sudo() -> bool:
+    """Cache sudo credentials so cleanup can use `sudo -n` without re-prompting.
+
+    Returns True if sudo is available without a prompt, or after a successful
+    `sudo -v` on a terminal. Returns False if sudo needs a password but no
+    terminal is available (batch mode).
+    """
+    if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
+        return True
+    if not sys.stdin.isatty():
+        return False
+    print("Caching sudo credentials for cleanup (enter password)...")
+    return subprocess.run(["sudo", "-v"], capture_output=True).returncode == 0
+
+
 def _active_namespaces() -> Set[str]:
     """Namespaces vopono currently tracks as running."""
     try:
@@ -242,21 +258,6 @@ def cleanup_vopono() -> None:
     """Full cleanup: orphaned interfaces + stale namespaces."""
     cleanup_vopono_interfaces()
     cleanup_stale_namespaces()
-
-
-def ensure_sudo() -> bool:
-    """Cache sudo credentials so cleanup can use `sudo -n` without re-prompting.
-
-    Returns True if sudo is available without a prompt, or after a successful
-    `sudo -v` on a terminal. Returns False if sudo needs a password but no
-    terminal is available (batch mode).
-    """
-    if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
-        return True
-    if not sys.stdin.isatty():
-        return False
-    print("Caching sudo credentials for cleanup (enter password)...")
-    return subprocess.run(["sudo", "-v"], capture_output=True).returncode == 0
 
 
 def _kill_process_group(proc: "subprocess.Popen") -> None:
@@ -322,7 +323,7 @@ def run_vopono(
         sys.exit("vopono is not installed or not on PATH")
 
 
-def main() -> None:
+def main():
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -364,9 +365,9 @@ def main() -> None:
         return
 
     if args.restore_failed:
-        src_path = FAILED_DIR / args.restore_failed
-        if src_path.exists():
-            shutil.move(str(src_path), str(VPN_PROFILES_DIR / args.restore_failed))
+        src = FAILED_DIR / args.restore_failed
+        if src.exists():
+            shutil.move(str(src), str(VPN_PROFILES_DIR / args.restore_failed))
             print(f"Restored {args.restore_failed} to active profiles")
         else:
             print(f"Profile not found in failed: {args.restore_failed}")
@@ -409,6 +410,7 @@ def main() -> None:
 
             print(f"\nTrying profile: {profile.name}")
             success, returncode, output = run_vopono(profile, quote_command(command), args.verbose)
+
             if not args.no_cleanup:
                 cleanup_vopono()
 
@@ -432,10 +434,11 @@ def main() -> None:
                 save_state(state)
                 print("Success! Profile marked as used today.")
                 break
-            print(f"Profile {profile.name} failed, moving to failed folder...")
-            move_to_failed(profile)
-            state = load_state()
-            state = reset_daily_state_if_needed(state)
+            else:
+                print(f"Profile {profile.name} failed, moving to failed folder...")
+                move_to_failed(profile)
+                state = load_state()
+                state = reset_daily_state_if_needed(state)
     except KeyboardInterrupt:
         print("\nInterrupted.")
         if not args.no_cleanup:
@@ -444,6 +447,7 @@ def main() -> None:
     finally:
         if not args.no_cleanup:
             cleanup_vopono()
+
 
 if __name__ == "__main__":
     main()
