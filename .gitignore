@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+vpn_profiles/
+vpn_profiles_failed/
+vpn_state.json
