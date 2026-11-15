@@ -8,7 +8,7 @@ VPN Rotator for testing a command inside a VPN namespace.
 
 The command is handed to `vopono exec` as a single shell-split string, so you
 can pass arguments too:
-    python main.py -- mytool --flag value
+    revpn -- mytool --flag value
 
 The executable is looked up with shutil.which() first - the same thing as
 wrapping it in "$(which __COMMAND__)" - because vopono launches it through
@@ -30,9 +30,13 @@ from datetime import date
 from pathlib import Path
 from typing import List, Optional, Sequence, Set, Tuple
 
-VPN_PROFILES_DIR = Path("vpn_profiles")
-FAILED_DIR = Path("vpn_profiles_failed")
-STATE_FILE = Path("vpn_state.json")
+BASE_DIR = Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+VPN_PROFILES_DIR = BASE_DIR / "vpn_profiles"
+FAILED_DIR = BASE_DIR / "vpn_profiles_failed"
+STATE_FILE = BASE_DIR / "vpn_state.json"
 DEFAULT_COMMAND = "papapopo"
 TIMEOUT = 30
 INTERFACE_PREFIX = "vo_c_"
@@ -331,7 +335,7 @@ def main():
         epilog=(
             "The command defaults to 'papapopo' and is resolved via which.\n"
             "Use -- before the command if it has flags of its own:\n"
-            "  python main.py -- mytool --verbose --input x"
+            "  revpn -- mytool --verbose --input x"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -343,12 +347,23 @@ def main():
     parser.add_argument("--cleanup-only", action="store_true", help="Delete leftover vo_c_* interfaces and exit")
     parser.add_argument("--no-cleanup", action="store_true", help="Skip cleanup of leftover vo_c_* interfaces")
     parser.add_argument(
+        "--fetch",
+        action="store_true",
+        help="Download VPN Gate profiles into vpn_profiles/ and exit",
+    )
+    parser.add_argument(
         "command",
         nargs="*",
         metavar="COMMAND",
         help=f"Command (and arguments) to run inside the VPN. Default: {DEFAULT_COMMAND}",
     )
     args = parser.parse_args()
+
+    if args.fetch:
+        import fetch_profiles
+
+        fetch_profiles.download_profiles()
+        return
 
     if args.list:
         profiles = get_available_profiles()
@@ -423,7 +438,7 @@ def main():
                     print(
                         f"Error: cannot find {command[0]!r} inside the VPN namespace.\n"
                         "Pass an absolute path instead, e.g.:\n"
-                        f"  python main.py -- {Path(command[0]).expanduser().absolute()} <args>",
+                        f"  revpn -- {Path(command[0]).expanduser().absolute()} <args>",
                         file=sys.stderr,
                     )
                     print(f"Not quarantining {profile.name}: this is a command problem, not a VPN problem.", file=sys.stderr)

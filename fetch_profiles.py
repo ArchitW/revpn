@@ -37,7 +37,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 API_URL = "https://www.vpngate.net/api/iphone/"
-PROFILES_DIR = Path("vpn_profiles")
+BASE_DIR = Path(__file__).resolve().parent
+PROFILES_DIR = BASE_DIR / "vpn_profiles"
 FETCH_TIMEOUT = 30
 # Some endpoints reject non-browser user agents; VPN Gate is lenient but this
 # keeps us on the safe side.
@@ -118,6 +119,68 @@ def existing_remotes(directory: Path) -> Set[str]:
     return found
 
 
+def download_profiles(out_dir=None, force=False, limit=0) -> None:
+    """Download VPN Gate profiles into out_dir (default: vpn_profiles/)."""
+    out_dir = Path(out_dir) if out_dir else PROFILES_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Fetching {API_URL} ...")
+    try:
+        lines = fetch_lines(API_URL)
+    except Exception as e:  # noqa: BLE001 - surface any fetch error cleanly
+        sys.exit(f"Failed to fetch VPN Gate list: {e}")
+
+    known_remotes = existing_remotes(out_dir)
+
+    downloaded = skipped = failed = 0
+    for line in lines:
+        if not line or line.startswith("*") or line.startswith("#"):
+            continue
+        if limit and downloaded >= limit:
+            break
+
+        row = parse_row(line)
+        if not row:
+            failed += 1
+            continue
+
+        hostport = remote_host_port(row["config"])
+        if not hostport:
+            failed += 1
+            continue
+        host, port = hostport
+        proto = proto_of(row["config"])
+
+        if not force and host in known_remotes:
+            skipped += 1
+            continue
+
+        filename = f"vpngate_{row['hostname']}_{proto}_{port}.ovpn"
+        dest = out_dir / filename
+        if dest.exists() and not force:
+            skipped += 1
+            continue
+
+        try:
+            dest.write_text(row["config"])
+        except OSError as e:
+            print(f"  ! could not write {filename}: {e}", file=sys.stderr)
+            failed += 1
+            continue
+
+        known_remotes.add(host)
+        downloaded += 1
+        print(
+            f"  + {filename}  "
+            f"({row['country']}, ping {row['ping']}ms, speed {row['speed']})"
+        )
+
+    print(
+        f"\nDone. downloaded={downloaded} skipped={skipped} failed={failed}\n"
+        f"Profiles in {out_dir}"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Download OpenVPN profiles from VPN Gate into vpn_profiles/",
@@ -142,64 +205,7 @@ def main():
     )
     args = parser.parse_args()
 
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"Fetching {API_URL} ...")
-    try:
-        lines = fetch_lines(API_URL)
-    except Exception as e:  # noqa: BLE001 - surface any fetch error cleanly
-        sys.exit(f"Failed to fetch VPN Gate list: {e}")
-
-    known_remotes = existing_remotes(out_dir)
-
-    downloaded = skipped = failed = 0
-    for line in lines:
-        if not line or line.startswith("*") or line.startswith("#"):
-            continue
-        if args.limit and downloaded >= args.limit:
-            break
-
-        row = parse_row(line)
-        if not row:
-            failed += 1
-            continue
-
-        hostport = remote_host_port(row["config"])
-        if not hostport:
-            failed += 1
-            continue
-        host, port = hostport
-        proto = proto_of(row["config"])
-
-        if not args.force and host in known_remotes:
-            skipped += 1
-            continue
-
-        filename = f"vpngate_{row['hostname']}_{proto}_{port}.ovpn"
-        dest = out_dir / filename
-        if dest.exists() and not args.force:
-            skipped += 1
-            continue
-
-        try:
-            dest.write_text(row["config"])
-        except OSError as e:
-            print(f"  ! could not write {filename}: {e}", file=sys.stderr)
-            failed += 1
-            continue
-
-        known_remotes.add(host)
-        downloaded += 1
-        print(
-            f"  + {filename}  "
-            f"({row['country']}, ping {row['ping']}ms, speed {row['speed']})"
-        )
-
-    print(
-        f"\nDone. downloaded={downloaded} skipped={skipped} failed={failed}\n"
-        f"Profiles in {out_dir}"
-    )
+    download_profiles(out_dir=args.out, force=args.force, limit=args.limit)
 
 
 if __name__ == "__main__":
