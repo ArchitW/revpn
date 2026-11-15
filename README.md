@@ -28,7 +28,7 @@ revpn --list
 revpn --fetch
 ```
 
-`revpn` resolves `vpn_profiles/`, `vpn_profiles_failed/`, and `vpn_state.json` **relative to the repository** (not your current directory), so the profile pool and state are shared no matter where you invoke it from. The command you run (firefox, …) executes in the directory you invoke from.
+`revpn` resolves `vpn_profiles/`, `vpn_profiles_failed/`, and `vpn_state.json` **relative to the repository** (not your current directory), so the profile pool and state are shared no matter where you invoke it from. The command you run (firefox, etc.) executes in the directory you invoke from.
 
 If you'd rather not install a global command, run `python3 main.py ...` from the repository root instead — everything below applies to both.
 
